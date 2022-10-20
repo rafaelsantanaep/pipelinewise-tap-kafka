@@ -2,17 +2,15 @@
 import os
 import sys
 import json
+
 import singer
-
 from singer import utils
-from confluent_kafka import Consumer, KafkaException
+from kafka import KafkaConsumer
 
-from tap_kafka import sync
-from tap_kafka import common
+import tap_kafka.sync as sync
+import tap_kafka.common as common
 
-from .errors import InvalidTimestampException, InvalidConfigException, DiscoveryException
-
-LOGGER = singer.get_logger('tap_kafka')
+LOGGER = singer.get_logger()
 
 REQUIRED_CONFIG_KEYS = [
     'bootstrap_servers',
@@ -20,17 +18,19 @@ REQUIRED_CONFIG_KEYS = [
     'topic'
 ]
 
-DEFAULT_INITIAL_START_TIME = 'latest'
+
 DEFAULT_MAX_RUNTIME_MS = 300000
 DEFAULT_COMMIT_INTERVAL_MS = 5000
+DEFAULT_BATCH_SIZE_ROWS = 1000
+DEFAULT_BATCH_FLUSH_INTERVAL_MS = 60000
 DEFAULT_CONSUMER_TIMEOUT_MS = 10000
 DEFAULT_SESSION_TIMEOUT_MS = 30000
 DEFAULT_HEARTBEAT_INTERVAL_MS = 10000
 DEFAULT_MAX_POLL_INTERVAL_MS = 300000
 DEFAULT_MAX_POLL_RECORDS = 500
-DEFAULT_MESSAGE_FORMAT = 'json'
-DEFAULT_PROTO_SCHEMA = None
-DEFAULT_PROTO_CLASSES_DIR = os.path.join(os.getcwd(), 'tap-kafka-proto-classes')
+DEFAULT_ENCODING = 'utf-8'
+DEFAULT_LOCAL_STORE_DIR = os.path.join(os.getcwd(), 'tap-kafka-local-store')
+DEFAULT_LOCAL_STORE_BATCH_SIZE_ROWS = 1000
 
 
 def dump_catalog(all_streams):
@@ -41,84 +41,67 @@ def dump_catalog(all_streams):
 def do_discovery(config):
     """Discover kafka topic by trying to connect to the topic and generate singer schema
     according to the config"""
-    consumer = Consumer({
-        'bootstrap.servers': config['bootstrap_servers'],
-        'group.id': config['group_id'],
-        'auto.offset.reset': 'earliest',
-    })
-
     try:
-        topic = config['topic']
+        if "avro_schema" in config and config["avro_schema"]:
+            LOGGER.info(f"avro_schema value set to {config['avro_schema']}, using avro deserializer.")
+            from kafkian.serde.deserialization import AvroDeserializer
+            avd = AvroDeserializer(schema_registry_url=config['avro_schema'])
+            deserializer = avd.deserialize
+        else:
+            def deserializer(m):
+                return json.loads(m.decode(config['encoding']))
+        consumer = KafkaConsumer(config['topic'],
+                                 group_id=config['group_id'],
+                                 enable_auto_commit=False,
+                                 consumer_timeout_ms=config['consumer_timeout_ms'],
+                                 security_protocol=config['security_protocol'],
+                                 value_deserializer=deserializer,
+                                 bootstrap_servers=config['bootstrap_servers'].split(','))
 
-        LOGGER.info(f"Discovering {topic} topic...")
-        cluster_md = consumer.list_topics(topic=topic, timeout=config['session_timeout_ms'] / 1000)
-        topic_md = cluster_md.topics[topic]
+    except Exception as ex:
+        LOGGER.warning("Unable to connect to kafka. bootstrap_servers: %s, topic: %s, group_id: %s",
+                       config['bootstrap_servers'].split(','), config['topic'], config['group_id'])
+        LOGGER.warning(ex)
+        raise ex
 
-        if topic_md.error:
-            raise KafkaException(topic_md.error)
-
-    except KafkaException as exc:
+    if config['topic'] not in consumer.topics():
         LOGGER.warning("Unable to view topic %s. bootstrap_servers: %s, topic: %s, group_id: %s",
                        config['topic'],
-                       config['bootstrap_servers'], config['topic'], config['group_id'])
-
-        consumer.close()
-        raise DiscoveryException('Unable to view topic {} - {}'.format(config['topic'], exc))
+                       config['bootstrap_servers'].split(','), config['topic'], config['group_id'])
+        raise Exception('Unable to view topic {}'.format(config['topic']))
 
     dump_catalog(common.generate_catalog(config))
-    consumer.close()
 
 
 def get_args():
     return utils.parse_args(REQUIRED_CONFIG_KEYS)
 
 
-def validate_config(config) -> None:
-    """Validate configuration"""
-    for required_key in REQUIRED_CONFIG_KEYS:
-        if required_key not in config.keys():
-            raise InvalidConfigException(f'Invalid config. {required_key} not found in config.')
-
-    initial_start_time = config.get('initial_start_time')
-    if initial_start_time and initial_start_time not in ['latest', 'earliest']:
-        try:
-            sync.iso_timestamp_to_epoch(config.get('initial_start_time'))
-        except InvalidTimestampException:
-            raise InvalidConfigException("Invalid config. initial_start_time needs to be one of 'earliest', "
-                                         "'latest' or a valid ISO-8601 formatted timestamp string")
-
-    if config.get('message_format') not in ['json', 'protobuf']:
-        raise InvalidConfigException("Invalid config. message_format needs to be one of 'json' or 'protobuf'")
-
-    if config.get('message_format') == 'protobuf' and not config.get('proto_schema'):
-        raise InvalidConfigException("Invalid config. Cannot find required proto_schema for protobuf message type")
-
-
 def generate_config(args_config):
-    config = {
+    return {
         # Add required parameters
         'topic': args_config['topic'],
         'group_id': args_config['group_id'],
-        'bootstrap_servers': args_config['bootstrap_servers'],
+        'bootstrap_servers': args_config['bootstrap_servers'].split(','),
 
         # Add optional parameters with defaults
         'primary_keys': args_config.get('primary_keys', {}),
-        'use_message_key': args_config.get('use_message_key', True),
-        'initial_start_time': args_config.get('initial_start_time', DEFAULT_INITIAL_START_TIME),
-        'max_runtime_ms': args_config.get('max_runtime_ms', DEFAULT_MAX_RUNTIME_MS),
+        'max_runtime_ms': int(args_config.get('max_runtime_ms', DEFAULT_MAX_RUNTIME_MS)),
         'commit_interval_ms': args_config.get('commit_interval_ms', DEFAULT_COMMIT_INTERVAL_MS),
+        'batch_size_rows': args_config.get('batch_size_rows', DEFAULT_BATCH_SIZE_ROWS),
+        'batch_flush_interval_ms': args_config.get('batch_flush_interval_ms', DEFAULT_BATCH_FLUSH_INTERVAL_MS),
         'consumer_timeout_ms': args_config.get('consumer_timeout_ms', DEFAULT_CONSUMER_TIMEOUT_MS),
         'session_timeout_ms': args_config.get('session_timeout_ms', DEFAULT_SESSION_TIMEOUT_MS),
         'heartbeat_interval_ms': args_config.get('heartbeat_interval_ms', DEFAULT_HEARTBEAT_INTERVAL_MS),
         'max_poll_records': args_config.get('max_poll_records', DEFAULT_MAX_POLL_RECORDS),
         'max_poll_interval_ms': args_config.get('max_poll_interval_ms', DEFAULT_MAX_POLL_INTERVAL_MS),
-        'message_format': args_config.get('message_format', DEFAULT_MESSAGE_FORMAT),
-        'proto_schema': args_config.get('proto_schema', DEFAULT_PROTO_SCHEMA),
-        'proto_classes_dir': args_config.get('proto_classes_dir', DEFAULT_PROTO_CLASSES_DIR),
+        'encoding': args_config.get('encoding', DEFAULT_ENCODING),
+        'local_store_dir': args_config.get('local_store_dir', DEFAULT_LOCAL_STORE_DIR),
+        'local_store_batch_size_rows': args_config.get('local_store_batch_size_rows',
+                                                       DEFAULT_LOCAL_STORE_BATCH_SIZE_ROWS),
+        'avro_schema': args_config.get('avro_schema', ''),
+        'security_protocol': args_config.get('security_protocol', 'SSL')
     }
-
-    validate_config(config)
-    return config
 
 
 def main_impl():
@@ -127,10 +110,16 @@ def main_impl():
     kafka_config = generate_config(args.config)
 
     if args.discover:
-        do_discovery(kafka_config)
+        do_discovery(args.config)
+
     elif args.properties:
         state = args.state or {}
-        sync.do_sync(kafka_config, args.properties, state)
+        sync.do_sync(kafka_config, args.properties, state, fn_get_args=get_args)
+    elif "catalog_path" in args and args.catalog_path:
+        state = args.state or {}
+        with open(args.catalog_path) as json_file:
+            catalog = json.load(json_file)
+        sync.do_sync(kafka_config, catalog, state, fn_get_args=get_args)
     else:
         LOGGER.info("No properties were selected")
 
